@@ -269,6 +269,11 @@ struct tps43_drv_data {
     bool drag_active;
     bool suspended;         
     bool touching;          
+
+    /* single-finger motion filtering around two-finger gestures (see tps43_work_handler) */
+    int64_t touch_down_ms;  /* when the current touch started */
+    int64_t last_multi_ms;  /* last frame with 2+ fingers in the current touch (0 = none) */
+    int32_t pending_x, pending_y; /* single-finger motion held during the settle window */
 };
 
 int tps43_set_sleep(const struct device *dev, bool sleep);

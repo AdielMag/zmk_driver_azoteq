@@ -9,6 +9,11 @@
 #include <zephyr/sys/byteorder.h>
 #include <zephyr/input/input.h>
 #include <zephyr/dt-bindings/input/input-event-codes.h>
+
+/* Single-finger motion this soon after touch-down is held (a 2nd finger may still land). */
+#define TPS43_SETTLE_MS 40
+/* Single-finger frames this soon after a 2+ finger frame are dropped (gesture tail/merge). */
+#define TPS43_MULTI_GRACE_MS 150
 #include <zephyr/logging/log.h>
 #include <stdlib.h>
 #include <math.h>
@@ -393,9 +398,14 @@ static void tps43_work_handler(struct k_work *work) {
     int16_t rel_x = (int16_t)((touch_data[5] << 8) | touch_data[6]);
     int16_t rel_y = (int16_t)((touch_data[7] << 8) | touch_data[8]);
 
+    const int64_t now = k_uptime_get();
     bool is_touching = (num_fingers > 0);
     if (is_touching != drv_data->touching) {
         drv_data->touching = is_touching;
+        drv_data->touch_down_ms = now;
+        drv_data->last_multi_ms = 0;
+        drv_data->pending_x = 0;
+        drv_data->pending_y = 0;
         LOG_INF("Touch state changed: %s", is_touching ? "down" : "up");
         input_report_key(dev, INPUT_BTN_TOUCH, is_touching ? 1 : 0, true, K_FOREVER);
     }
@@ -442,6 +452,12 @@ static void tps43_work_handler(struct k_work *work) {
         input_report_key(dev, INPUT_BTN_0, 0, true, K_FOREVER);   // release + sync
     }
 
+    if (num_fingers > 1) {
+        drv_data->last_multi_ms = now;
+        drv_data->pending_x = 0;
+        drv_data->pending_y = 0;
+    }
+
     if (rel_x != 0 || rel_y != 0) {
         // Handle three-finger swipes
         if (config->swipes) {
@@ -482,7 +498,23 @@ static void tps43_work_handler(struct k_work *work) {
             // move the cursor: otherwise the first pixels of every two-finger scroll, and frames
             // outside the scroll angle, jump the pointer.
             LOG_DBG("Ignoring %u-finger movement (not a scroll/zoom frame)", num_fingers);
+        } else if (drv_data->last_multi_ms != 0 &&
+                   now - drv_data->last_multi_ms < TPS43_MULTI_GRACE_MS) {
+            // The chip briefly reports one finger in the middle/end of a two-finger gesture
+            // (fingers merge or one lifts first); that delta is often a centroid jump. Drop it.
+            LOG_DBG("Ignoring 1-finger movement right after a multi-finger frame");
+        } else if (drv_data->last_multi_ms == 0 &&
+                   now - drv_data->touch_down_ms < TPS43_SETTLE_MS) {
+            // Fingers of a two-finger scroll rarely land together: hold the first finger's
+            // motion briefly. Flushed below once the window ends with still one finger;
+            // discarded if a second finger arrives.
+            drv_data->pending_x += rel_x;
+            drv_data->pending_y += rel_y;
         } else {
+            rel_x = (int16_t)CLAMP(rel_x + drv_data->pending_x, INT16_MIN, INT16_MAX);
+            rel_y = (int16_t)CLAMP(rel_y + drv_data->pending_y, INT16_MIN, INT16_MAX);
+            drv_data->pending_x = 0;
+            drv_data->pending_y = 0;
             // Normal cursor movement
             if (rel_x != 0 ) {
                 int32_t scaled_x = ((int32_t)rel_x * config->sensitivity) / 100;
@@ -523,6 +555,10 @@ static int tps43_reset_values(const struct device *dev) {
     drv_data->device_ready = false;
     drv_data->initialized = false;
     drv_data->drag_active = false;
+    drv_data->touch_down_ms = 0;
+    drv_data->last_multi_ms = 0;
+    drv_data->pending_x = 0;
+    drv_data->pending_y = 0;
 
     LOG_INF("Values reset");
     return 0;
