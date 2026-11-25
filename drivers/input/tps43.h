@@ -277,6 +277,7 @@ struct tps43_drv_data {
     /* single-finger motion filtering around two-finger gestures (see tps43_work_handler) */
     int64_t touch_down_ms;  /* when the current touch started */
     int64_t last_multi_ms;  /* last frame with 2+ fingers in the current touch (0 = none) */
+    int64_t move_start_ms; /* time of first non-zero 1-finger motion this touch (0 = none yet) */
     int32_t pending_x, pending_y; /* single-finger motion held during the settle window */
 
     /* own two-finger scroll from absolute positions */
