@@ -11,6 +11,12 @@
 #include <zephyr/dt-bindings/input/input-event-codes.h>
 
 /* Single-finger motion this soon after touch-down is held (a 2nd finger may still land). */
+/* The chip sometimes loses a moving finger for 1-3 frames (25-47 ms seen) and re-acquires it with
+ * lower strength: that looked like touch-up + new touch-down, which (a) dropped the motion across
+ * the gap, restarted the chip's zero-motion frames and our hold, and (b) at the end of a stroke
+ * made a 12-48 ms ghost contact that counted as a tap. A touch-up is now only believed once the
+ * pad has stayed empty this long; a finger back before that continues the same touch. */
+#define TPS43_LIFT_DEBOUNCE_MS 60
 #define TPS43_SETTLE_MS 65
 /* The chip reports ~3 zero-motion frames after touch-down, so the 30 ms above often ends before
  * the first real motion; a fast two-finger swipe (2nd finger lands up to ~50 ms late) then moved
@@ -516,6 +522,10 @@ static void tps43_work_handler(struct k_work *work) {
             sys_get_be16(&touch_data[13]), touch_data[15],
             drv_data->touching ? (int)(now - drv_data->touch_down_ms) : -1,
             drv_data->last_multi_ms ? (int)(now - drv_data->last_multi_ms) : -1);
+    if (num_fingers == 0 && drv_data->touching &&
+        now - drv_data->last_touch_ms < TPS43_LIFT_DEBOUNCE_MS) {
+        goto done; /* probably a dropout, not a lift: keep the touch alive */
+    }
     bool is_touching = (num_fingers > 0);
 
     /* ---- own tap tracking ---- */
