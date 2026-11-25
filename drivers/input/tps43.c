@@ -11,12 +11,12 @@
 #include <zephyr/dt-bindings/input/input-event-codes.h>
 
 /* Single-finger motion this soon after touch-down is held (a 2nd finger may still land). */
-#define TPS43_SETTLE_MS 65
+#define TPS43_SETTLE_MS 45
 /* The chip reports ~3 zero-motion frames after touch-down, so the 30 ms above often ends before
  * the first real motion; a fast two-finger swipe (2nd finger lands up to ~50 ms late) then moved
  * the cursor first. Also hold for this long after the first non-zero 1-finger motion, but never
  * past TPS43_SETTLE_MAX_MS after touch-down. Nothing is lost: the held motion is flushed. */
-#define TPS43_SETTLE_MOTION_MS 25
+#define TPS43_SETTLE_MOTION_MS 12
 #define TPS43_SETTLE_MAX_MS 150
 /* Single-finger frames this soon after a 2+ finger frame are dropped (gesture tail/merge). */
 #define TPS43_MULTI_GRACE_MS 150
