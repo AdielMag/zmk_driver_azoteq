@@ -499,9 +499,10 @@ static void tps43_work_handler(struct k_work *work) {
     /* one line per frame for gesture debugging (debug builds only; CONFIG_LOG is off otherwise);
      * idle polls (no finger, none before) are not logged */
     if (num_fingers > 0 || drv_data->touching || gestures_events[0] || gestures_events[1])
-    LOG_INF("FRAME t=%d f=%u g0=%02X g1=%02X dx=%d dy=%d sx=%d sy=%d sinceDown=%d sinceMulti=%d",
+    LOG_INF("FRAME t=%d f=%u g0=%02X g1=%02X dx=%d dy=%d sx=%d sy=%d str=%u area=%u sinceDown=%d sinceMulti=%d",
             (int)now, num_fingers, gestures_events[0], gestures_events[1], rel_x, rel_y,
             num_fingers == 2 ? abs_sum_x : -1, num_fingers == 2 ? abs_sum_y : -1,
+            sys_get_be16(&touch_data[13]), touch_data[15],
             drv_data->touching ? (int)(now - drv_data->touch_down_ms) : -1,
             drv_data->last_multi_ms ? (int)(now - drv_data->last_multi_ms) : -1);
     bool is_touching = (num_fingers > 0);
