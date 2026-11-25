@@ -274,6 +274,12 @@ struct tps43_drv_data {
     int64_t touch_down_ms;  /* when the current touch started */
     int64_t last_multi_ms;  /* last frame with 2+ fingers in the current touch (0 = none) */
     int32_t pending_x, pending_y; /* single-finger motion held during the settle window */
+
+    /* own two-finger scroll from absolute positions */
+    bool sc_have_prev;
+    char sc_axis;                 /* 0 = not started, 'X' or 'Y' = locked axis */
+    int32_t sc_prev_x, sc_prev_y; /* previous sum of the two fingers' positions */
+    int32_t sc_acc_x, sc_acc_y;   /* unsent motion, sum units (2 x centroid) */
 };
 
 int tps43_set_sleep(const struct device *dev, bool sleep);

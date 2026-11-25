@@ -11,9 +11,15 @@
 #include <zephyr/dt-bindings/input/input-event-codes.h>
 
 /* Single-finger motion this soon after touch-down is held (a 2nd finger may still land). */
-#define TPS43_SETTLE_MS 40
+#define TPS43_SETTLE_MS 80
 /* Single-finger frames this soon after a 2+ finger frame are dropped (gesture tail/merge). */
 #define TPS43_MULTI_GRACE_MS 150
+/* Own two-finger scroll (centroid of the two absolute finger positions): the chip's scroll
+ * gesture needs several frames to recognise and often never fires on a short swipe. The
+ * centroid must move this far (resolution units) before scrolling starts and the axis locks. */
+#define TPS43_SCROLL_START 6
+/* A centroid jump larger than this between frames is a finger change, not motion. */
+#define TPS43_SCROLL_JUMP 300
 #include <zephyr/logging/log.h>
 #include <stdlib.h>
 #include <math.h>
@@ -384,8 +390,10 @@ static void tps43_work_handler(struct k_work *work) {
      *   [4] NUM_FINGERS        (0x0011)
      *   [5..6] REL_X           (0x0012, big-endian)
      *   [7..8] REL_Y           (0x0014, big-endian)
+     *   [9..12] finger 1 ABS_X, ABS_Y (0x0016, big-endian), [13..15] strength/area
+     *   [16..19] finger 2 ABS_X, ABS_Y (0x001D, big-endian)
      */
-    uint8_t touch_data[(TPS43_REG_REL_Y + 2) - TPS43_REG_GESTURE_EVENTS_0];
+    uint8_t touch_data[0x0021 - TPS43_REG_GESTURE_EVENTS_0];
     ret = read_sequence_registers(dev, TPS43_REG_GESTURE_EVENTS_0, touch_data,
                                   sizeof(touch_data));
     if (ret < 0) {
@@ -397,11 +405,15 @@ static void tps43_work_handler(struct k_work *work) {
     uint8_t num_fingers = touch_data[4];
     int16_t rel_x = (int16_t)((touch_data[5] << 8) | touch_data[6]);
     int16_t rel_y = (int16_t)((touch_data[7] << 8) | touch_data[8]);
+    /* sum of the two fingers' absolute positions (= 2 x centroid; order-independent) */
+    const int32_t abs_sum_x = sys_get_be16(&touch_data[9]) + sys_get_be16(&touch_data[16]);
+    const int32_t abs_sum_y = sys_get_be16(&touch_data[11]) + sys_get_be16(&touch_data[18]);
 
     const int64_t now = k_uptime_get();
     /* one line per frame for gesture debugging (debug builds only; CONFIG_LOG is off otherwise) */
-    LOG_INF("FRAME t=%d f=%u g0=%02X g1=%02X dx=%d dy=%d sinceDown=%d sinceMulti=%d", (int)now,
-            num_fingers, gestures_events[0], gestures_events[1], rel_x, rel_y,
+    LOG_INF("FRAME t=%d f=%u g0=%02X g1=%02X dx=%d dy=%d sx=%d sy=%d sinceDown=%d sinceMulti=%d",
+            (int)now, num_fingers, gestures_events[0], gestures_events[1], rel_x, rel_y,
+            num_fingers == 2 ? abs_sum_x : -1, num_fingers == 2 ? abs_sum_y : -1,
             drv_data->touching ? (int)(now - drv_data->touch_down_ms) : -1,
             drv_data->last_multi_ms ? (int)(now - drv_data->last_multi_ms) : -1);
     bool is_touching = (num_fingers > 0);
@@ -411,6 +423,10 @@ static void tps43_work_handler(struct k_work *work) {
         drv_data->last_multi_ms = 0;
         drv_data->pending_x = 0;
         drv_data->pending_y = 0;
+        drv_data->sc_have_prev = false;
+        drv_data->sc_axis = 0;
+        drv_data->sc_acc_x = 0;
+        drv_data->sc_acc_y = 0;
         LOG_INF("Touch state changed: %s", is_touching ? "down" : "up");
         input_report_key(dev, INPUT_BTN_TOUCH, is_touching ? 1 : 0, true, K_FOREVER);
     }
@@ -439,8 +455,8 @@ static void tps43_work_handler(struct k_work *work) {
             is_drag_active = true;
             input_report_key(dev, INPUT_BTN_0, 1, true, K_FOREVER); 
         }
-        if (gestures_events[1] & TPS43_SCROLL) {
-            // set scroll flag for processing in tp_movement block
+        if ((gestures_events[1] & TPS43_SCROLL) && num_fingers != 2) {
+            // two-finger scroll is handled from absolute positions below
             is_scroll_active = true;
         }
         if (gestures_events[1] & TPS43_ZOOM) {
@@ -461,6 +477,50 @@ static void tps43_work_handler(struct k_work *work) {
         drv_data->last_multi_ms = now;
         drv_data->pending_x = 0;
         drv_data->pending_y = 0;
+    }
+
+    if (num_fingers == 2) {
+        if (drv_data->sc_have_prev) {
+            int32_t dx = abs_sum_x - drv_data->sc_prev_x;
+            int32_t dy = abs_sum_y - drv_data->sc_prev_y;
+
+            if (abs(dx) <= 2 * TPS43_SCROLL_JUMP && abs(dy) <= 2 * TPS43_SCROLL_JUMP) {
+                drv_data->sc_acc_x += dx;
+                drv_data->sc_acc_y += dy;
+            }
+        }
+        drv_data->sc_prev_x = abs_sum_x;
+        drv_data->sc_prev_y = abs_sum_y;
+        drv_data->sc_have_prev = true;
+
+        if (!drv_data->sc_axis &&
+            MAX(abs(drv_data->sc_acc_x), abs(drv_data->sc_acc_y)) >= 2 * TPS43_SCROLL_START) {
+            drv_data->sc_axis = abs(drv_data->sc_acc_y) >= abs(drv_data->sc_acc_x) ? 'Y' : 'X';
+        }
+        if (drv_data->sc_axis) {
+            bool vert = drv_data->sc_axis == 'Y';
+            int32_t *acc = vert ? &drv_data->sc_acc_y : &drv_data->sc_acc_x;
+            int32_t d = *acc / 2; /* sum units -> centroid units */
+
+            *acc -= d * 2;
+            if (vert) {
+                drv_data->sc_acc_x = 0;
+            } else {
+                drv_data->sc_acc_y = 0;
+            }
+            if (d != 0) {
+                if (vert ? config->invert_scroll_y : config->invert_scroll_x) {
+                    d = -d;
+                }
+                int32_t wheel = CLAMP((d * config->scroll_sensitivity) / 100, INT16_MIN, INT16_MAX);
+
+                LOG_INF("Scrolling %d %s", wheel, vert ? "vertically" : "horizontally");
+                input_report_rel(dev, vert ? INPUT_REL_WHEEL : INPUT_REL_HWHEEL, wheel, true,
+                                 K_FOREVER);
+            }
+        }
+    } else {
+        drv_data->sc_have_prev = false; /* finger count changed: the centroid jumps */
     }
 
     if (rel_x != 0 || rel_y != 0) {
