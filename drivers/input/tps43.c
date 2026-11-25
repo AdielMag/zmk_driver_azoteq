@@ -11,7 +11,7 @@
 #include <zephyr/dt-bindings/input/input-event-codes.h>
 
 /* Single-finger motion this soon after touch-down is held (a 2nd finger may still land). */
-#define TPS43_SETTLE_MS 80
+#define TPS43_SETTLE_MS 30
 /* Single-finger frames this soon after a 2+ finger frame are dropped (gesture tail/merge). */
 #define TPS43_MULTI_GRACE_MS 150
 /* Own two-finger scroll (centroid of the two absolute finger positions): the chip's scroll
@@ -20,6 +20,16 @@
 #define TPS43_SCROLL_START 6
 /* A centroid jump larger than this between frames is a finger change, not motion. */
 #define TPS43_SCROLL_JUMP 300
+/* Frames are read on a dedicated work queue: a blocked input report (busy split link) must not
+ * stall the system work queue (BLE), and BLE load must not delay trackpad reads. */
+#define TPS43_WQ_STACK 2048
+#define TPS43_WQ_PRIO 5
+/* Watchdog: if RDY is held high with no read for this long, an RDY edge was missed and the chip
+ * is waiting for us; read it instead of waiting for the chip's own I2C timeout (seconds). */
+#define TPS43_WD_MS 100
+#define TPS43_RDY_STUCK_MS 60
+/* Motion reports may be dropped rather than block the reader when the input queue is full. */
+#define TPS43_REL_TIMEOUT K_MSEC(30)
 #include <zephyr/logging/log.h>
 #include <stdlib.h>
 #include <math.h>
@@ -195,6 +205,10 @@ static int tps43_i2c_write_reg8(const struct device *dev, uint16_t reg, uint8_t 
     return 0;
 }
 
+K_THREAD_STACK_DEFINE(tps43_wq_stack, TPS43_WQ_STACK);
+static struct k_work_q tps43_wq;
+static bool tps43_wq_started;
+
 /**
  * @brief Callback handler for RDY pin interrupt from trackpad
  * 
@@ -209,8 +223,22 @@ static int tps43_i2c_write_reg8(const struct device *dev, uint16_t reg, uint8_t 
  static void tps43_rdy_callback(const struct device *dev, struct gpio_callback *cb, uint32_t pins) {
      struct tps43_drv_data *drv_data = CONTAINER_OF(cb, struct tps43_drv_data, rdy_cb);
  
-     k_work_submit(&drv_data->work);
+     k_work_submit_to_queue(&tps43_wq, &drv_data->work);
  }
+
+static void tps43_wd_fn(struct k_work *work) {
+    struct k_work_delayable *dw = k_work_delayable_from_work(work);
+    struct tps43_drv_data *d = CONTAINER_OF(dw, struct tps43_drv_data, wd_work);
+    const struct tps43_config *config = d->dev->config;
+
+    if (d->initialized && !d->suspended && config->rdy_gpio.port != NULL &&
+        gpio_pin_get_dt(&config->rdy_gpio) == 1 &&
+        k_uptime_get() - d->last_frame_ms >= TPS43_RDY_STUCK_MS && !k_work_is_pending(&d->work)) {
+        LOG_WRN("RDY stuck high %d ms; reading to recover", (int)(k_uptime_get() - d->last_frame_ms));
+        k_work_submit_to_queue(&tps43_wq, &d->work);
+    }
+    k_work_schedule(dw, K_MSEC(TPS43_WD_MS));
+}
  
 
 /** Dump charging state */
@@ -410,6 +438,7 @@ static void tps43_work_handler(struct k_work *work) {
     const int32_t abs_sum_y = sys_get_be16(&touch_data[11]) + sys_get_be16(&touch_data[18]);
 
     const int64_t now = k_uptime_get();
+    drv_data->last_frame_ms = now;
     /* one line per frame for gesture debugging (debug builds only; CONFIG_LOG is off otherwise) */
     LOG_INF("FRAME t=%d f=%u g0=%02X g1=%02X dx=%d dy=%d sx=%d sy=%d sinceDown=%d sinceMulti=%d",
             (int)now, num_fingers, gestures_events[0], gestures_events[1], rel_x, rel_y,
@@ -516,7 +545,7 @@ static void tps43_work_handler(struct k_work *work) {
 
                 LOG_INF("Scrolling %d %s", wheel, vert ? "vertically" : "horizontally");
                 input_report_rel(dev, vert ? INPUT_REL_WHEEL : INPUT_REL_HWHEEL, wheel, true,
-                                 K_FOREVER);
+                                 TPS43_REL_TIMEOUT);
             }
         }
     } else {
@@ -541,7 +570,7 @@ static void tps43_work_handler(struct k_work *work) {
                 }
                 int16_t wheel = (rel_x * config->scroll_sensitivity) / 100;
                 LOG_INF("Scrolling %d horizontally", wheel);
-                input_report_rel(dev, INPUT_REL_HWHEEL, wheel, true, K_FOREVER);
+                input_report_rel(dev, INPUT_REL_HWHEEL, wheel, true, TPS43_REL_TIMEOUT);
             } else {
                 // Vertical scroll
                 if (config->invert_scroll_y) {
@@ -549,14 +578,14 @@ static void tps43_work_handler(struct k_work *work) {
                 }
                 int16_t wheel = (rel_y * config->scroll_sensitivity) / 100;
                 LOG_INF("Scrolling %d vertically", wheel);
-                input_report_rel(dev, INPUT_REL_WHEEL, wheel, true, K_FOREVER);
+                input_report_rel(dev, INPUT_REL_WHEEL, wheel, true, TPS43_REL_TIMEOUT);
             }
             is_scroll_active = false;
         } else if (is_zoom_active) {
             // Zoom processing: the zoom amount comes in via rel_x
             int16_t zoom_delta = (rel_x * config->zoom_sensitivity) / 100;
             LOG_INF("Zooming %d, rel_x=%d", zoom_delta, rel_x);
-            input_report_rel(dev, INPUT_REL_MISC, zoom_delta, true, K_FOREVER);
+            input_report_rel(dev, INPUT_REL_MISC, zoom_delta, true, TPS43_REL_TIMEOUT);
             is_zoom_active = false;
         } else if (num_fingers > 1) {
             // Two or more fingers that the chip has not (yet) classified as scroll/zoom must not
@@ -578,7 +607,7 @@ static void tps43_work_handler(struct k_work *work) {
             if (wheel != 0) {
                 LOG_INF("Scrolling %d %s (1 finger, session)", wheel, vert ? "vertically" : "horizontally");
                 input_report_rel(dev, vert ? INPUT_REL_WHEEL : INPUT_REL_HWHEEL, wheel, true,
-                                 K_FOREVER);
+                                 TPS43_REL_TIMEOUT);
             }
         } else if (drv_data->last_multi_ms != 0 &&
                    now - drv_data->last_multi_ms < TPS43_MULTI_GRACE_MS) {
@@ -608,8 +637,8 @@ static void tps43_work_handler(struct k_work *work) {
             }
             LOG_INF("Sending movement: dx=%d, dy=%d", rel_x, rel_y);
 
-            input_report_rel(dev, INPUT_REL_X, rel_x, false, K_FOREVER);
-            input_report_rel(dev, INPUT_REL_Y, rel_y, true, K_FOREVER);
+            input_report_rel(dev, INPUT_REL_X, rel_x, false, TPS43_REL_TIMEOUT);
+            input_report_rel(dev, INPUT_REL_Y, rel_y, true, TPS43_REL_TIMEOUT);
         }
     }
 
@@ -1486,6 +1515,17 @@ static int tps43_init(const struct device *dev) {
         return ret;
     }
 
+    // Semaphore + work items must exist before the RDY interrupt can fire.
+    k_sem_init(&drv_data->lock, 1, 1);
+    if (!tps43_wq_started) {
+        k_work_queue_start(&tps43_wq, tps43_wq_stack, K_THREAD_STACK_SIZEOF(tps43_wq_stack),
+                           TPS43_WQ_PRIO, NULL);
+        k_thread_name_set(&tps43_wq.thread, "tps43_wq");
+        tps43_wq_started = true;
+    }
+    k_work_init(&drv_data->work, tps43_work_handler);
+    k_work_init_delayable(&drv_data->wd_work, tps43_wd_fn);
+
     // configure RDY interrupts only AFTER device configuration!
     if (config->rdy_gpio.port != NULL) {
         ret = gpio_pin_configure_dt(&config->rdy_gpio, GPIO_INPUT);
@@ -1513,9 +1553,8 @@ static int tps43_init(const struct device *dev) {
     // Initialize semaphore to protect I2C operations
     // First parameter - initial count (1 = available)
     // Second parameter - maximum count (1 = binary semaphore)
-    k_sem_init(&drv_data->lock, 1, 1);
-
-    k_work_init(&drv_data->work, tps43_work_handler);
+    drv_data->last_frame_ms = k_uptime_get();
+    k_work_schedule(&drv_data->wd_work, K_MSEC(500));
 
     tps43_dump_registers(dev);
     

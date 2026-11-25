@@ -263,6 +263,8 @@ struct tps43_drv_data {
     struct k_sem lock;
     struct gpio_callback rdy_cb;
     struct k_work work;
+    struct k_work_delayable wd_work; /* recovers a missed RDY edge (chip stuck waiting for a read) */
+    int64_t last_frame_ms;           /* uptime of the last frame read */
 
     bool device_ready;
     bool initialized;
