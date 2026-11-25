@@ -14,15 +14,6 @@
 #define TPS43_SETTLE_MS 40
 /* Single-finger frames this soon after a 2+ finger frame are dropped (gesture tail/merge). */
 #define TPS43_MULTI_GRACE_MS 150
-
-/* Momentum scroll: after the fingers lift mid-scroll, keep scrolling and slow down.
- * Velocity is in wheel counts per 10 ms frame, Q8 fixed point. */
-#define TPS43_MOM_TICK_MS 10
-#define TPS43_MOM_FRICTION_Q8 243   /* velocity *= 243/256 (~0.95) per tick */
-#define TPS43_MOM_LIFT_MS 100       /* last scroll frame must be this recent at lift */
-#define TPS43_MOM_MIN_START_Q8 384  /* need >= 1.5 counts/frame to start */
-#define TPS43_MOM_STOP_Q8 48        /* stop below ~0.19 counts/frame */
-
 #include <zephyr/logging/log.h>
 #include <stdlib.h>
 #include <math.h>
@@ -31,46 +22,6 @@
 #include "tps43.h"
 
 LOG_MODULE_REGISTER(tps43, CONFIG_INPUT_LOG_LEVEL);
-
-static void tps43_mom_stop(struct tps43_drv_data *d) {
-    k_work_cancel_delayable(&d->mom_work);
-    d->mom_active = false;
-    d->mom_v_q8 = 0;
-    d->mom_rem_q8 = 0;
-}
-
-static void tps43_mom_work_fn(struct k_work *work) {
-    struct k_work_delayable *dw = k_work_delayable_from_work(work);
-    struct tps43_drv_data *d = CONTAINER_OF(dw, struct tps43_drv_data, mom_work);
-
-    if (!d->mom_active || d->touching || d->suspended) {
-        d->mom_active = false;
-        return;
-    }
-    d->mom_v_q8 = (d->mom_v_q8 * TPS43_MOM_FRICTION_Q8) / 256;
-    if (abs(d->mom_v_q8) < TPS43_MOM_STOP_Q8) {
-        tps43_mom_stop(d);
-        return;
-    }
-    int32_t total = d->mom_v_q8 + d->mom_rem_q8;
-    int32_t out = total / 256;
-
-    d->mom_rem_q8 = total - out * 256;
-    if (out != 0) {
-        input_report_rel(d->dev, d->mom_code, out, true, K_FOREVER);
-    }
-    k_work_schedule(&d->mom_work, K_MSEC(TPS43_MOM_TICK_MS));
-}
-
-/* Called for every scroll frame: smoothed velocity (EMA, alpha 1/2) on the active axis. */
-static void tps43_mom_track(struct tps43_drv_data *d, uint16_t code, int16_t wheel, int64_t now) {
-    if (d->mom_code != code) {
-        d->mom_v_q8 = 0;
-        d->mom_code = code;
-    }
-    d->mom_v_q8 = (d->mom_v_q8 + (int32_t)wheel * 256) / 2;
-    d->last_scroll_ms = now;
-}
  
 /**
  * @brief Ends communication window with trackpad
@@ -462,19 +413,6 @@ static void tps43_work_handler(struct k_work *work) {
         drv_data->pending_y = 0;
         LOG_INF("Touch state changed: %s", is_touching ? "down" : "up");
         input_report_key(dev, INPUT_BTN_TOUCH, is_touching ? 1 : 0, true, K_FOREVER);
-        if (is_touching) {
-            tps43_mom_stop(drv_data); /* touching again stops a momentum scroll */
-        } else if (drv_data->last_scroll_ms &&
-                   now - drv_data->last_scroll_ms <= TPS43_MOM_LIFT_MS &&
-                   abs(drv_data->mom_v_q8) >= TPS43_MOM_MIN_START_Q8) {
-            LOG_INF("Momentum start v=%d/256", drv_data->mom_v_q8);
-            drv_data->mom_active = true;
-            drv_data->mom_rem_q8 = 0;
-            k_work_schedule(&drv_data->mom_work, K_MSEC(TPS43_MOM_TICK_MS));
-        } else {
-            drv_data->mom_v_q8 = 0;
-        }
-        drv_data->last_scroll_ms = 0;
     }
 
     if (gestures_events[0] != 0 || gestures_events[1] != 0) {
@@ -543,7 +481,6 @@ static void tps43_work_handler(struct k_work *work) {
                 }
                 int16_t wheel = (rel_x * config->scroll_sensitivity) / 100;
                 LOG_INF("Scrolling %d horizontally", wheel);
-                tps43_mom_track(drv_data, INPUT_REL_HWHEEL, wheel, now);
                 input_report_rel(dev, INPUT_REL_HWHEEL, wheel, true, K_FOREVER);
             } else {
                 // Vertical scroll
@@ -552,7 +489,6 @@ static void tps43_work_handler(struct k_work *work) {
                 }
                 int16_t wheel = (rel_y * config->scroll_sensitivity) / 100;
                 LOG_INF("Scrolling %d vertically", wheel);
-                tps43_mom_track(drv_data, INPUT_REL_WHEEL, wheel, now);
                 input_report_rel(dev, INPUT_REL_WHEEL, wheel, true, K_FOREVER);
             }
             is_scroll_active = false;
@@ -1503,7 +1439,6 @@ static int tps43_init(const struct device *dev) {
     k_sem_init(&drv_data->lock, 1, 1);
 
     k_work_init(&drv_data->work, tps43_work_handler);
-    k_work_init_delayable(&drv_data->mom_work, tps43_mom_work_fn);
 
     tps43_dump_registers(dev);
     
