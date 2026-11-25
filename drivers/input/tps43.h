@@ -265,6 +265,8 @@ struct tps43_drv_data {
     struct k_work work;
     struct k_work_delayable wd_work; /* recovers a missed RDY edge (chip stuck waiting for a read) */
     int64_t last_frame_ms;           /* uptime of the last frame read */
+    int64_t last_touch_ms;           /* uptime of the last frame with a finger */
+    uint32_t rdy_irqs, polls;        /* diagnostics */
 
     bool device_ready;
     bool initialized;

@@ -26,9 +26,15 @@
 #define TPS43_WQ_PRIO 5
 /* Watchdog: if RDY is held high with no read for this long, an RDY edge was missed and the chip
  * is waiting for us; read it instead of waiting for the chip's own I2C timeout (seconds). */
-#define TPS43_WD_MS 20
+#define TPS43_WD_MS 4
 #define TPS43_RDY_STUCK_MS 15
-#define TPS43_TOUCH_POLL_MS 40
+/* RDY on this board stops pulsing after the first frames of a touch (seen on tp-v8: every frame
+ * after touch-down came from a forced read). So the pad is also polled: a read outside the
+ * chip's window clock-stretches until its next cycle, i.e. it returns the next frame. */
+#define TPS43_TOUCH_POLL_MS 8    /* finger down: read again this soon after the last frame */
+#define TPS43_IDLE_POLL_MS 40    /* no finger, used recently: catch touch-down within ~1-2 cycles */
+#define TPS43_SLOW_POLL_MS 150   /* no touch for TPS43_SLOW_AFTER_MS: save battery */
+#define TPS43_SLOW_AFTER_MS 30000
 /* RDY is level-triggered: the interrupt is disabled in the ISR and re-armed after the frame is
  * read. Edge interrupts were losing RDY pulses for seconds at a time (motion then arrived as one
  * huge jump), and a level interrupt cannot miss a window that is still open. */
@@ -235,6 +241,7 @@ static bool tps43_wq_started;
  static void tps43_rdy_callback(const struct device *dev, struct gpio_callback *cb, uint32_t pins) {
      struct tps43_drv_data *drv_data = CONTAINER_OF(cb, struct tps43_drv_data, rdy_cb);
 
+     drv_data->rdy_irqs++;
      k_work_submit_to_queue(&tps43_wq, &drv_data->work);
  }
 
@@ -248,26 +255,32 @@ static void tps43_wd_fn(struct k_work *work) {
         k_uptime_get() - d->last_frame_ms >= TPS43_RDY_STUCK_MS && !k_work_is_pending(&d->work)) {
         LOG_WRN("RDY stuck high %d ms; reading to recover", (int)(k_uptime_get() - d->last_frame_ms));
         k_work_submit_to_queue(&tps43_wq, &d->work);
-    } else if (d->initialized && !d->suspended && d->touching &&
-               k_uptime_get() - d->last_frame_ms >= TPS43_TOUCH_POLL_MS &&
-               k_work_busy_get(&d->work) == 0) {
-        /* finger down but the chip went quiet: force a read (it clock-stretches to its next
-         * cycle), so motion never piles up into one big jump */
-        LOG_WRN("no frame for %d ms while touching; forcing read",
-                (int)(k_uptime_get() - d->last_frame_ms));
-        k_work_submit_to_queue(&tps43_wq, &d->work);
+    } else if (d->initialized && !d->suspended && k_work_busy_get(&d->work) == 0) {
+        int64_t age = k_uptime_get() - d->last_frame_ms;
+        int64_t quiet = k_uptime_get() - d->last_touch_ms;
+        int32_t poll = d->touching                     ? TPS43_TOUCH_POLL_MS
+                       : quiet < TPS43_SLOW_AFTER_MS ? TPS43_IDLE_POLL_MS
+                                                     : TPS43_SLOW_POLL_MS;
+
+        if (age >= poll) {
+            d->polls++;
+            k_work_submit_to_queue(&tps43_wq, &d->work);
+        }
     }
 
     /* status heartbeat (debug builds): shows whether the driver is alive and RDY's level */
     static int64_t hb;
     if (k_uptime_get() - hb >= 5000) {
         hb = k_uptime_get();
-        LOG_INF("HB init=%d susp=%d touch=%d rdy=%d since_frame=%d", d->initialized, d->suspended,
-                d->touching, config->rdy_gpio.port ? gpio_pin_get_dt(&config->rdy_gpio) : -1,
-                (int)(k_uptime_get() - d->last_frame_ms));
+        LOG_INF("HB init=%d susp=%d touch=%d rdy=%d since_frame=%d rdy_irqs=%u polls=%u",
+                d->initialized, d->suspended, d->touching,
+                config->rdy_gpio.port ? gpio_pin_get_dt(&config->rdy_gpio) : -1,
+                (int)(k_uptime_get() - d->last_frame_ms), d->rdy_irqs, d->polls);
     }
-    /* fast while in use, slow when the pad has been quiet for a second (battery) */
-    k_work_schedule(dw, K_MSEC(k_uptime_get() - d->last_frame_ms < 1000 ? TPS43_WD_MS : 200));
+    /* fast while in use, slower once the pad has been untouched for a while (battery) */
+    k_work_schedule(dw, K_MSEC(d->touching ? TPS43_WD_MS
+                               : k_uptime_get() - d->last_touch_ms < TPS43_SLOW_AFTER_MS ? 10
+                                                                                       : 50));
 }
  
 
@@ -469,7 +482,12 @@ static void tps43_work_handler(struct k_work *work) {
 
     const int64_t now = k_uptime_get();
     drv_data->last_frame_ms = now;
-    /* one line per frame for gesture debugging (debug builds only; CONFIG_LOG is off otherwise) */
+    if (num_fingers > 0) {
+        drv_data->last_touch_ms = now;
+    }
+    /* one line per frame for gesture debugging (debug builds only; CONFIG_LOG is off otherwise);
+     * idle polls (no finger, none before) are not logged */
+    if (num_fingers > 0 || drv_data->touching || gestures_events[0] || gestures_events[1])
     LOG_INF("FRAME t=%d f=%u g0=%02X g1=%02X dx=%d dy=%d sx=%d sy=%d sinceDown=%d sinceMulti=%d",
             (int)now, num_fingers, gestures_events[0], gestures_events[1], rel_x, rel_y,
             num_fingers == 2 ? abs_sum_x : -1, num_fingers == 2 ? abs_sum_y : -1,
