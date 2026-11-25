@@ -40,7 +40,7 @@
  * huge jump), and a level interrupt cannot miss a window that is still open. */
 #define TPS43_RDY_INT GPIO_INT_EDGE_TO_ACTIVE /* level-triggered stopped RDY entirely (tp-v7) */
 /* Motion reports may be dropped rather than block the reader when the input queue is full. */
-#define TPS43_REL_TIMEOUT K_MSEC(30)
+#define TPS43_REL_TIMEOUT K_MSEC(500) /* wait, do not drop: 30 ms dropped motion when the split link was busy */
 /* Own taps, decided on lift: a touch no longer than this, that stayed within TAP_DIST
  * (resolution units) of where it landed and never scrolled/dragged, is a click.
  * One finger = left click, two fingers = right click. */
