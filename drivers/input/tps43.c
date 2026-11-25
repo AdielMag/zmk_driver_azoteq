@@ -32,7 +32,7 @@
 /* RDY is level-triggered: the interrupt is disabled in the ISR and re-armed after the frame is
  * read. Edge interrupts were losing RDY pulses for seconds at a time (motion then arrived as one
  * huge jump), and a level interrupt cannot miss a window that is still open. */
-#define TPS43_RDY_INT GPIO_INT_LEVEL_ACTIVE
+#define TPS43_RDY_INT GPIO_INT_EDGE_TO_ACTIVE /* level-triggered stopped RDY entirely (tp-v7) */
 /* Motion reports may be dropped rather than block the reader when the input queue is full. */
 #define TPS43_REL_TIMEOUT K_MSEC(30)
 /* Own taps, decided on lift: a touch no longer than this, that stayed within TAP_DIST
@@ -234,19 +234,9 @@ static bool tps43_wq_started;
  */
  static void tps43_rdy_callback(const struct device *dev, struct gpio_callback *cb, uint32_t pins) {
      struct tps43_drv_data *drv_data = CONTAINER_OF(cb, struct tps43_drv_data, rdy_cb);
-     const struct tps43_config *config = drv_data->dev->config;
 
-     gpio_pin_interrupt_configure_dt(&config->rdy_gpio, GPIO_INT_DISABLE); /* re-armed after read */
      k_work_submit_to_queue(&tps43_wq, &drv_data->work);
  }
-
-static void tps43_rdy_arm(struct tps43_drv_data *d) {
-    const struct tps43_config *config = d->dev->config;
-
-    if (config->rdy_gpio.port != NULL && d->initialized && !d->suspended) {
-        gpio_pin_interrupt_configure_dt(&config->rdy_gpio, TPS43_RDY_INT);
-    }
-}
 
 static void tps43_wd_fn(struct k_work *work) {
     struct k_work_delayable *dw = k_work_delayable_from_work(work);
@@ -266,8 +256,15 @@ static void tps43_wd_fn(struct k_work *work) {
         LOG_WRN("no frame for %d ms while touching; forcing read",
                 (int)(k_uptime_get() - d->last_frame_ms));
         k_work_submit_to_queue(&tps43_wq, &d->work);
-    } else if (k_work_busy_get(&d->work) == 0) {
-        tps43_rdy_arm(d); /* never leave RDY disarmed (idempotent) */
+    }
+
+    /* status heartbeat (debug builds): shows whether the driver is alive and RDY's level */
+    static int64_t hb;
+    if (k_uptime_get() - hb >= 5000) {
+        hb = k_uptime_get();
+        LOG_INF("HB init=%d susp=%d touch=%d rdy=%d since_frame=%d", d->initialized, d->suspended,
+                d->touching, config->rdy_gpio.port ? gpio_pin_get_dt(&config->rdy_gpio) : -1,
+                (int)(k_uptime_get() - d->last_frame_ms));
     }
     /* fast while in use, slow when the pad has been quiet for a second (battery) */
     k_work_schedule(dw, K_MSEC(k_uptime_get() - d->last_frame_ms < 1000 ? TPS43_WD_MS : 200));
@@ -715,7 +712,6 @@ done:
     
     // Release semaphore after completing all I2C operations
     k_sem_give(&drv_data->lock);
-    tps43_rdy_arm(drv_data);
 }
 
 /**
