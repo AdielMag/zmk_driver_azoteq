@@ -399,6 +399,11 @@ static void tps43_work_handler(struct k_work *work) {
     int16_t rel_y = (int16_t)((touch_data[7] << 8) | touch_data[8]);
 
     const int64_t now = k_uptime_get();
+    /* one line per frame for gesture debugging (debug builds only; CONFIG_LOG is off otherwise) */
+    LOG_INF("FRAME t=%d f=%u g0=%02X g1=%02X dx=%d dy=%d sinceDown=%d sinceMulti=%d", (int)now,
+            num_fingers, gestures_events[0], gestures_events[1], rel_x, rel_y,
+            drv_data->touching ? (int)(now - drv_data->touch_down_ms) : -1,
+            drv_data->last_multi_ms ? (int)(now - drv_data->last_multi_ms) : -1);
     bool is_touching = (num_fingers > 0);
     if (is_touching != drv_data->touching) {
         drv_data->touching = is_touching;
