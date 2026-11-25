@@ -11,12 +11,17 @@
 #include <zephyr/dt-bindings/input/input-event-codes.h>
 
 /* Single-finger motion this soon after touch-down is held (a 2nd finger may still land). */
-#define TPS43_SETTLE_MS 45
+#define TPS43_SETTLE_MS 65
 /* The chip reports ~3 zero-motion frames after touch-down, so the 30 ms above often ends before
  * the first real motion; a fast two-finger swipe (2nd finger lands up to ~50 ms late) then moved
  * the cursor first. Also hold for this long after the first non-zero 1-finger motion, but never
  * past TPS43_SETTLE_MAX_MS after touch-down. Nothing is lost: the held motion is flushed. */
-#define TPS43_SETTLE_MOTION_MS 12
+#define TPS43_SETTLE_MOTION_MS 25
+/* Only motion at least this big (|dx|+|dy| per frame) is held: a fast swipe's first-finger frames
+ * are huge (the cursor jumped by 80-240 counts), while an ordinary slow/medium cursor start is
+ * smaller and passes straight through, so one-finger movement has no added lag. Once something is
+ * held, everything stays held until the window ends (order is kept). */
+#define TPS43_SETTLE_FAST 40
 #define TPS43_SETTLE_MAX_MS 150
 /* Single-finger frames this soon after a 2+ finger frame are dropped (gesture tail/merge). */
 #define TPS43_MULTI_GRACE_MS 150
@@ -715,6 +720,8 @@ static void tps43_work_handler(struct k_work *work) {
             // (fingers merge or one lifts first); that delta is often a centroid jump. Drop it.
             LOG_DBG("Ignoring 1-finger movement right after a multi-finger frame");
         } else if (drv_data->last_multi_ms == 0 &&
+                   (drv_data->pending_x != 0 || drv_data->pending_y != 0 ||
+                    abs(rel_x) + abs(rel_y) >= TPS43_SETTLE_FAST) &&
                    (now - drv_data->touch_down_ms < TPS43_SETTLE_MS ||
                     ((drv_data->move_start_ms == 0 || now - drv_data->move_start_ms < TPS43_SETTLE_MOTION_MS) &&
                      now - drv_data->touch_down_ms < TPS43_SETTLE_MAX_MS))) {
