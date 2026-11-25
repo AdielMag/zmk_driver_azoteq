@@ -479,7 +479,7 @@ static void tps43_work_handler(struct k_work *work) {
         drv_data->pending_y = 0;
     }
 
-    if (num_fingers == 2) {
+    if (num_fingers == 2 && !is_zoom_active) {
         if (drv_data->sc_have_prev) {
             int32_t dx = abs_sum_x - drv_data->sc_prev_x;
             int32_t dy = abs_sum_y - drv_data->sc_prev_y;
@@ -563,6 +563,23 @@ static void tps43_work_handler(struct k_work *work) {
             // move the cursor: otherwise the first pixels of every two-finger scroll, and frames
             // outside the scroll angle, jump the pointer.
             LOG_DBG("Ignoring %u-finger movement (not a scroll/zoom frame)", num_fingers);
+        } else if (num_fingers == 1 && drv_data->sc_axis) {
+            // The chip drops to one finger in the middle of a slow two-finger scroll. Keep
+            // scrolling on the locked axis (the single finger moves like the centroid) until every
+            // finger lifts; never turn the rest of the swipe into cursor motion.
+            bool vert = drv_data->sc_axis == 'Y';
+            int32_t d = vert ? rel_y : rel_x;
+
+            if (vert ? config->invert_scroll_y : config->invert_scroll_x) {
+                d = -d;
+            }
+            int32_t wheel = CLAMP((d * config->scroll_sensitivity) / 100, INT16_MIN, INT16_MAX);
+
+            if (wheel != 0) {
+                LOG_INF("Scrolling %d %s (1 finger, session)", wheel, vert ? "vertically" : "horizontally");
+                input_report_rel(dev, vert ? INPUT_REL_WHEEL : INPUT_REL_HWHEEL, wheel, true,
+                                 K_FOREVER);
+            }
         } else if (drv_data->last_multi_ms != 0 &&
                    now - drv_data->last_multi_ms < TPS43_MULTI_GRACE_MS) {
             // The chip briefly reports one finger in the middle/end of a two-finger gesture
