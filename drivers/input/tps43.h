@@ -282,6 +282,12 @@ struct tps43_drv_data {
     char sc_axis;                 /* 0 = not started, 'X' or 'Y' = locked axis */
     int32_t sc_prev_x, sc_prev_y; /* previous sum of the two fingers' positions */
     int32_t sc_acc_x, sc_acc_y;   /* unsent motion, sum units (2 x centroid) */
+
+    /* own tap detection (the chip's tap flag misses quick taps and fires after slides) */
+    uint8_t tap_maxf;             /* most fingers seen in this touch */
+    bool tap_have0;               /* tap_x0/y0 valid (first one-finger frame seen) */
+    bool tap_spoiled;             /* scroll/drag/movement happened: not a tap */
+    int32_t tap_x0, tap_y0;       /* first finger position at touch-down */
 };
 
 int tps43_set_sleep(const struct device *dev, bool sleep);

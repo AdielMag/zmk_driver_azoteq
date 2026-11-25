@@ -30,6 +30,13 @@
 #define TPS43_RDY_STUCK_MS 60
 /* Motion reports may be dropped rather than block the reader when the input queue is full. */
 #define TPS43_REL_TIMEOUT K_MSEC(30)
+/* Own taps, decided on lift: a touch no longer than this, that stayed within TAP_DIST
+ * (resolution units) of where it landed and never scrolled/dragged, is a click.
+ * One finger = left click, two fingers = right click. */
+#define TPS43_TAP_MS 200
+#define TPS43_TAP2_MS 250
+#define TPS43_TAP_DIST 40
+#define TPS43_TAP_MOVE 60 /* summed relative motion limit */
 #include <zephyr/logging/log.h>
 #include <stdlib.h>
 #include <math.h>
@@ -446,6 +453,47 @@ static void tps43_work_handler(struct k_work *work) {
             drv_data->touching ? (int)(now - drv_data->touch_down_ms) : -1,
             drv_data->last_multi_ms ? (int)(now - drv_data->last_multi_ms) : -1);
     bool is_touching = (num_fingers > 0);
+
+    /* ---- own tap tracking ---- */
+    if (is_touching) {
+        if (!drv_data->touching) {
+            drv_data->tap_maxf = 0;
+            drv_data->tap_have0 = false;
+            drv_data->tap_spoiled = false;
+        }
+        drv_data->tap_maxf = MAX(drv_data->tap_maxf, num_fingers);
+        if (num_fingers == 1) {
+            int32_t x1 = sys_get_be16(&touch_data[9]);
+            int32_t y1 = sys_get_be16(&touch_data[11]);
+
+            if (!drv_data->tap_have0) {
+                drv_data->tap_x0 = x1;
+                drv_data->tap_y0 = y1;
+                drv_data->tap_have0 = true;
+            } else if (drv_data->tap_maxf == 1 &&
+                       (abs(x1 - drv_data->tap_x0) > TPS43_TAP_DIST ||
+                        abs(y1 - drv_data->tap_y0) > TPS43_TAP_DIST)) {
+                drv_data->tap_spoiled = true;
+            }
+        }
+        if (abs(rel_x) + abs(rel_y) > TPS43_TAP_MOVE || drv_data->sc_axis || is_drag_active) {
+            drv_data->tap_spoiled = true;
+        }
+    } else if (drv_data->touching && !drv_data->tap_spoiled && !drv_data->sc_axis &&
+               !is_drag_active) {
+        int32_t dur = (int32_t)(now - drv_data->touch_down_ms);
+
+        if (drv_data->tap_maxf == 1 && dur <= TPS43_TAP_MS) {
+            LOG_INF("Tap (%d ms) -> LEFT BUTTON", dur);
+            input_report_key(dev, INPUT_BTN_0, 1, true, K_FOREVER);
+            input_report_key(dev, INPUT_BTN_0, 0, true, K_FOREVER);
+        } else if (drv_data->tap_maxf == 2 && dur <= TPS43_TAP2_MS) {
+            LOG_INF("Two-finger tap (%d ms) -> RIGHT BUTTON", dur);
+            input_report_key(dev, INPUT_BTN_1, 1, true, K_FOREVER);
+            input_report_key(dev, INPUT_BTN_1, 0, true, K_FOREVER);
+        }
+    }
+
     if (is_touching != drv_data->touching) {
         drv_data->touching = is_touching;
         drv_data->touch_down_ms = now;
@@ -464,20 +512,12 @@ static void tps43_work_handler(struct k_work *work) {
 
         LOG_INF("Gestures: Single=0x%02X, Multi=0x%02X", gestures_events[0], gestures_events[1]);
 
-        if (gestures_events[0] & TPS43_SINGLE_TAP) {
-            LOG_INF("Single tap → LEFT BUTTON");
-            input_report_key(dev, INPUT_BTN_0, 1, true, K_FOREVER);
-            input_report_key(dev, INPUT_BTN_0, 0, true, K_FOREVER);  
-        }
+        /* chip single/two-finger tap flags are ignored: taps are detected on lift above */
         if (gestures_events[0] & (TPS43_SWIPE_UP | TPS43_SWIPE_DOWN | TPS43_SWIPE_LEFT | TPS43_SWIPE_RIGHT)) {
             LOG_INF("Single finger swipe");
             tps43_handle_swipe(dev, rel_x, rel_y);
         }
-        if (gestures_events[1] & TPS43_TWO_FINGER_TAP) {
-            LOG_INF("Two finger tap → RIGHT BUTTON");
-            input_report_key(dev, INPUT_BTN_1, 1, true, K_FOREVER);  
-            input_report_key(dev, INPUT_BTN_1, 0, true, K_FOREVER); 
-        }
+
         if ((gestures_events[0] & TPS43_PRESS_AND_HOLD) && (!(is_drag_active))) {
             LOG_INF("Press and hold detected - DRAG (HOLD LEFT BUTTON)");
             // set internal drag flag and press left mouse button
