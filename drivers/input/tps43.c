@@ -28,6 +28,9 @@
  * smaller and passes straight through, so one-finger movement has no added lag. Once something is
  * held, everything stays held until the window ends (order is kept). */
 #define TPS43_SETTLE_FAST 40
+/* Motion that still got through before a 2nd finger landed (below the gate above) is taken back
+ * when the 2nd finger shows up this soon after touch-down: the cursor snaps back to where it was. */
+#define TPS43_UNDO_MS 250
 #define TPS43_SETTLE_MAX_MS 150
 /* Single-finger frames this soon after a 2+ finger frame are dropped (gesture tail/merge). */
 #define TPS43_MULTI_GRACE_MS 150
@@ -572,6 +575,8 @@ static void tps43_work_handler(struct k_work *work) {
         drv_data->touching = is_touching;
         drv_data->touch_down_ms = now;
         drv_data->move_start_ms = 0;
+        drv_data->sent_x = 0;
+        drv_data->sent_y = 0;
         drv_data->last_multi_ms = 0;
         drv_data->pending_x = 0;
         drv_data->pending_y = 0;
@@ -618,6 +623,17 @@ static void tps43_work_handler(struct k_work *work) {
     }
 
     if (num_fingers > 1) {
+        if (drv_data->last_multi_ms == 0 && (drv_data->sent_x != 0 || drv_data->sent_y != 0) &&
+            now - drv_data->touch_down_ms < TPS43_UNDO_MS) {
+            LOG_INF("2nd finger: undoing cursor leak dx=%d dy=%d", (int)-drv_data->sent_x,
+                    (int)-drv_data->sent_y);
+            input_report_rel(dev, INPUT_REL_X, (int16_t)CLAMP(-drv_data->sent_x, INT16_MIN, INT16_MAX),
+                             false, TPS43_REL_TIMEOUT);
+            input_report_rel(dev, INPUT_REL_Y, (int16_t)CLAMP(-drv_data->sent_y, INT16_MIN, INT16_MAX),
+                             true, TPS43_REL_TIMEOUT);
+        }
+        drv_data->sent_x = 0;
+        drv_data->sent_y = 0;
         drv_data->last_multi_ms = now;
         drv_data->pending_x = 0;
         drv_data->pending_y = 0;
@@ -758,6 +774,10 @@ static void tps43_work_handler(struct k_work *work) {
                 rel_y = (int16_t)CLAMP(scaled_y, INT16_MIN, INT16_MAX);
             }
             LOG_INF("Sending movement: dx=%d, dy=%d", rel_x, rel_y);
+            if (now - drv_data->touch_down_ms < TPS43_UNDO_MS) {
+                drv_data->sent_x += rel_x;
+                drv_data->sent_y += rel_y;
+            }
 
             input_report_rel(dev, INPUT_REL_X, rel_x, false, TPS43_REL_TIMEOUT);
             input_report_rel(dev, INPUT_REL_Y, rel_y, true, TPS43_REL_TIMEOUT);
