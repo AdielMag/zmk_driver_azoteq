@@ -274,6 +274,14 @@ struct tps43_drv_data {
     int64_t touch_down_ms;  /* when the current touch started */
     int64_t last_multi_ms;  /* last frame with 2+ fingers in the current touch (0 = none) */
     int32_t pending_x, pending_y; /* single-finger motion held during the settle window */
+
+    /* momentum scroll (runs on the system work queue, same as the frame handler) */
+    struct k_work_delayable mom_work;
+    bool mom_active;
+    uint16_t mom_code;      /* INPUT_REL_WHEEL or INPUT_REL_HWHEEL */
+    int32_t mom_v_q8;       /* counts per 10 ms frame, Q8 */
+    int32_t mom_rem_q8;
+    int64_t last_scroll_ms; /* last scroll frame of the current touch (0 = none) */
 };
 
 int tps43_set_sleep(const struct device *dev, bool sleep);
