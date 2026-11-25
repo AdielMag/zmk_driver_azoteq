@@ -467,8 +467,19 @@ static void tps43_work_handler(struct k_work *work) {
     uint8_t touch_data[0x0021 - TPS43_REG_GESTURE_EVENTS_0];
     ret = read_sequence_registers(dev, TPS43_REG_GESTURE_EVENTS_0, touch_data,
                                   sizeof(touch_data));
+    if (ret == -EIO) {
+        /* polled read while the chip is in a low-power mode: the first address is NACKed and
+         * wakes it; a retry >= 150 us later is ACKed (clock-stretched to its next cycle) */
+        k_busy_wait(200);
+        ret = read_sequence_registers(dev, TPS43_REG_GESTURE_EVENTS_0, touch_data,
+                                      sizeof(touch_data));
+    }
     if (ret < 0) {
-        LOG_ERR("Touch data read error: %d", ret);
+        static uint32_t errs;
+
+        if ((errs++ % 100) == 0) {
+            LOG_ERR("Touch data read error: %d (x%u)", ret, errs);
+        }
         goto done;
     }
 
