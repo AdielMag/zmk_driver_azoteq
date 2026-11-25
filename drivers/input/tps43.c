@@ -32,9 +32,9 @@
  * after touch-down came from a forced read). So the pad is also polled: a read outside the
  * chip's window clock-stretches until its next cycle, i.e. it returns the next frame. */
 #define TPS43_TOUCH_POLL_MS 8    /* finger down: read again this soon after the last frame */
-#define TPS43_IDLE_POLL_MS 40    /* no finger, used recently: catch touch-down within ~1-2 cycles */
-#define TPS43_SLOW_POLL_MS 150   /* no touch for TPS43_SLOW_AFTER_MS: save battery */
-#define TPS43_SLOW_AFTER_MS 30000
+#define TPS43_IDLE_POLL_MS 10    /* no finger, used recently: a tap contact can be ~20-40 ms, poll must be well under that */
+#define TPS43_SLOW_POLL_MS 40    /* no touch for TPS43_SLOW_AFTER_MS: save battery */
+#define TPS43_SLOW_AFTER_MS 120000
 /* RDY is level-triggered: the interrupt is disabled in the ISR and re-armed after the frame is
  * read. Edge interrupts were losing RDY pulses for seconds at a time (motion then arrived as one
  * huge jump), and a level interrupt cannot miss a window that is still open. */
