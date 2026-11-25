@@ -477,6 +477,11 @@ static void tps43_work_handler(struct k_work *work) {
             LOG_INF("Zooming %d, rel_x=%d", zoom_delta, rel_x);
             input_report_rel(dev, INPUT_REL_MISC, zoom_delta, true, K_FOREVER);
             is_zoom_active = false;
+        } else if (num_fingers > 1) {
+            // Two or more fingers that the chip has not (yet) classified as scroll/zoom must not
+            // move the cursor: otherwise the first pixels of every two-finger scroll, and frames
+            // outside the scroll angle, jump the pointer.
+            LOG_DBG("Ignoring %u-finger movement (not a scroll/zoom frame)", num_fingers);
         } else {
             // Normal cursor movement
             if (rel_x != 0 ) {
