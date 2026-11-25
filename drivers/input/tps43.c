@@ -26,8 +26,13 @@
 #define TPS43_WQ_PRIO 5
 /* Watchdog: if RDY is held high with no read for this long, an RDY edge was missed and the chip
  * is waiting for us; read it instead of waiting for the chip's own I2C timeout (seconds). */
-#define TPS43_WD_MS 100
-#define TPS43_RDY_STUCK_MS 60
+#define TPS43_WD_MS 20
+#define TPS43_RDY_STUCK_MS 15
+#define TPS43_TOUCH_POLL_MS 40
+/* RDY is level-triggered: the interrupt is disabled in the ISR and re-armed after the frame is
+ * read. Edge interrupts were losing RDY pulses for seconds at a time (motion then arrived as one
+ * huge jump), and a level interrupt cannot miss a window that is still open. */
+#define TPS43_RDY_INT GPIO_INT_LEVEL_ACTIVE
 /* Motion reports may be dropped rather than block the reader when the input queue is full. */
 #define TPS43_REL_TIMEOUT K_MSEC(30)
 /* Own taps, decided on lift: a touch no longer than this, that stayed within TAP_DIST
@@ -229,9 +234,19 @@ static bool tps43_wq_started;
  */
  static void tps43_rdy_callback(const struct device *dev, struct gpio_callback *cb, uint32_t pins) {
      struct tps43_drv_data *drv_data = CONTAINER_OF(cb, struct tps43_drv_data, rdy_cb);
- 
+     const struct tps43_config *config = drv_data->dev->config;
+
+     gpio_pin_interrupt_configure_dt(&config->rdy_gpio, GPIO_INT_DISABLE); /* re-armed after read */
      k_work_submit_to_queue(&tps43_wq, &drv_data->work);
  }
+
+static void tps43_rdy_arm(struct tps43_drv_data *d) {
+    const struct tps43_config *config = d->dev->config;
+
+    if (config->rdy_gpio.port != NULL && d->initialized && !d->suspended) {
+        gpio_pin_interrupt_configure_dt(&config->rdy_gpio, TPS43_RDY_INT);
+    }
+}
 
 static void tps43_wd_fn(struct k_work *work) {
     struct k_work_delayable *dw = k_work_delayable_from_work(work);
@@ -243,8 +258,19 @@ static void tps43_wd_fn(struct k_work *work) {
         k_uptime_get() - d->last_frame_ms >= TPS43_RDY_STUCK_MS && !k_work_is_pending(&d->work)) {
         LOG_WRN("RDY stuck high %d ms; reading to recover", (int)(k_uptime_get() - d->last_frame_ms));
         k_work_submit_to_queue(&tps43_wq, &d->work);
+    } else if (d->initialized && !d->suspended && d->touching &&
+               k_uptime_get() - d->last_frame_ms >= TPS43_TOUCH_POLL_MS &&
+               k_work_busy_get(&d->work) == 0) {
+        /* finger down but the chip went quiet: force a read (it clock-stretches to its next
+         * cycle), so motion never piles up into one big jump */
+        LOG_WRN("no frame for %d ms while touching; forcing read",
+                (int)(k_uptime_get() - d->last_frame_ms));
+        k_work_submit_to_queue(&tps43_wq, &d->work);
+    } else if (k_work_busy_get(&d->work) == 0) {
+        tps43_rdy_arm(d); /* never leave RDY disarmed (idempotent) */
     }
-    k_work_schedule(dw, K_MSEC(TPS43_WD_MS));
+    /* fast while in use, slow when the pad has been quiet for a second (battery) */
+    k_work_schedule(dw, K_MSEC(k_uptime_get() - d->last_frame_ms < 1000 ? TPS43_WD_MS : 200));
 }
  
 
@@ -346,7 +372,7 @@ static int tps43_set_suspend_internal(const struct device *dev, bool suspend, bo
 done:
     // Enable RDY interrupts after resume
     if (!suspend && config->rdy_gpio.port != NULL) {
-        ret = gpio_pin_interrupt_configure_dt(&config->rdy_gpio, GPIO_INT_EDGE_TO_ACTIVE);
+        ret = gpio_pin_interrupt_configure_dt(&config->rdy_gpio, TPS43_RDY_INT);
         if (ret == 0) {
             LOG_INF("RDY interrupts enabled");
         }
@@ -689,6 +715,7 @@ done:
     
     // Release semaphore after completing all I2C operations
     k_sem_give(&drv_data->lock);
+    tps43_rdy_arm(drv_data);
 }
 
 /**
@@ -1572,8 +1599,7 @@ static int tps43_init(const struct device *dev) {
         if (ret != 0) {
             LOG_WRN("RDY GPIO configuration error: %d", ret);
         } else {
-            ret = gpio_pin_interrupt_configure_dt(&config->rdy_gpio, 
-                                                    GPIO_INT_EDGE_TO_ACTIVE);
+            ret = gpio_pin_interrupt_configure_dt(&config->rdy_gpio, TPS43_RDY_INT);
             if (ret == 0) {
                 gpio_init_callback(&drv_data->rdy_cb, tps43_rdy_callback, 
                                     BIT(config->rdy_gpio.pin));
